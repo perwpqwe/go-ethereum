@@ -383,7 +383,7 @@ func (api *SimulatorAPI) SubscribeSimulationResults(ctx context.Context) (*rpc.S
 	api.simulator.logger.Info("Created subscription", "id", subscription.ID)
 
 	go func() {
-		results := make(chan *SimulationResult, 100)
+		results := make(chan *SimulationResult, 128)
 		sub := api.simulator.resultFeed.Subscribe(results)
 		defer sub.Unsubscribe()
 		
@@ -400,9 +400,6 @@ func (api *SimulatorAPI) SubscribeSimulationResults(ctx context.Context) (*rpc.S
 				notifier.Notify(subscription.ID, result)
 			case <-subscription.Err():
 				api.simulator.logger.Info("Subscription error, stopping goroutine", "subscriptionID", subscription.ID)
-				return
-			case <-ctx.Done():
-				api.simulator.logger.Info("Context done, stopping goroutine", "subscriptionID", subscription.ID)
 				return
 			}
 		}
