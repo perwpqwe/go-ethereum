@@ -85,6 +85,22 @@ Subscribes to simulation results. Returns a subscription that emits simulation r
 
 ## Example Usage
 
+### Using the JavaScript Console:
+
+```javascript
+// Get simulator status (will show running: false initially)
+simulator.status()
+
+// Start the simulator manually
+simulator.start()
+
+// Stop the simulator manually
+simulator.stop()
+
+// Check if simulator is running
+simulator.status().running
+```
+
 ### Using curl to interact with the simulator API:
 
 ```bash
@@ -99,6 +115,7 @@ curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","metho
 
 # Subscribe to simulation results (WebSocket)
 wscat -c ws://localhost:8546 -x '{"jsonrpc":"2.0","method":"simulator_subscribeSimulationResults","params":[],"id":1}'
+```
 
 ## How It Works
 

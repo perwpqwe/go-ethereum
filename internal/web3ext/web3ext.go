@@ -18,15 +18,16 @@
 package web3ext
 
 var Modules = map[string]string{
-	"admin":  AdminJs,
-	"clique": CliqueJs,
-	"debug":  DebugJs,
-	"eth":    EthJs,
-	"miner":  MinerJs,
-	"net":    NetJs,
-	"rpc":    RpcJs,
-	"txpool": TxpoolJs,
-	"dev":    DevJs,
+	"admin":    AdminJs,
+	"clique":   CliqueJs,
+	"debug":    DebugJs,
+	"eth":      EthJs,
+	"miner":    MinerJs,
+	"net":      NetJs,
+	"rpc":      RpcJs,
+	"simulator": SimulatorJs,
+	"txpool":   TxpoolJs,
+	"dev":      DevJs,
 }
 
 const CliqueJs = `
@@ -718,5 +719,29 @@ web3._extend({
 			params: 1
 		}),
 	],
+});
+`
+
+const SimulatorJs = `
+web3._extend({
+	property: 'simulator',
+	methods: [
+		new web3._extend.Method({
+			name: 'start',
+			call: 'simulator_start',
+			params: 0
+		}),
+		new web3._extend.Method({
+			name: 'stop',
+			call: 'simulator_stop',
+			params: 0
+		}),
+		new web3._extend.Method({
+			name: 'status',
+			call: 'simulator_status',
+			params: 0
+		}),
+	],
+	properties: []
 });
 `
