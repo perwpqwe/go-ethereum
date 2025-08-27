@@ -67,8 +67,15 @@ func (b *EthAPIBackend) SetHead(number uint64) {
 }
 
 func (b *EthAPIBackend) HeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Header, error) {
-	// Pending block is only known by the miner
+	// Pending block is provided by the simulator
 	if number == rpc.PendingBlockNumber {
+		if b.eth.simulator != nil && b.eth.simulator.IsRunning() {
+			_, header := b.eth.simulator.GetPendingState()
+			if header != nil {
+				return header, nil
+			}
+		}
+		// Fallback to miner if simulator is not available
 		block, _, _ := b.eth.miner.Pending()
 		if block == nil {
 			return nil, errors.New("pending block is not available")
@@ -124,8 +131,18 @@ func (b *EthAPIBackend) HeaderByHash(ctx context.Context, hash common.Hash) (*ty
 }
 
 func (b *EthAPIBackend) BlockByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Block, error) {
-	// Pending block is only known by the miner
+	// Pending block is provided by the simulator
 	if number == rpc.PendingBlockNumber {
+		if b.eth.simulator != nil && b.eth.simulator.IsRunning() {
+			state, header := b.eth.simulator.GetPendingState()
+			if state != nil && header != nil {
+				// For pending blocks, we mainly need the header and state
+				// The actual block creation is complex and not needed for most use cases
+				// Return nil to indicate no block is available, but header and state are
+				return nil, errors.New("pending block not available, but header and state are available via simulator")
+			}
+		}
+		// Fallback to miner if simulator is not available
 		block, _, _ := b.eth.miner.Pending()
 		if block == nil {
 			return nil, errors.New("pending block is not available")
@@ -220,8 +237,15 @@ func (b *EthAPIBackend) Pending() (*types.Block, types.Receipts, *state.StateDB)
 }
 
 func (b *EthAPIBackend) StateAndHeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*state.StateDB, *types.Header, error) {
-	// Pending state is only known by the miner
+	// Pending state is provided by the simulator
 	if number == rpc.PendingBlockNumber {
+		if b.eth.simulator != nil && b.eth.simulator.IsRunning() {
+			state, header := b.eth.simulator.GetPendingState()
+			if state != nil && header != nil {
+				return state, header, nil
+			}
+		}
+		// Fallback to miner if simulator is not available
 		block, _, state := b.eth.miner.Pending()
 		if block == nil || state == nil {
 			return nil, nil, errors.New("pending state is not available")

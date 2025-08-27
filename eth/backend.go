@@ -61,6 +61,7 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/ethereum/go-ethereum/simulator"
 	gethversion "github.com/ethereum/go-ethereum/version"
 )
 
@@ -124,6 +125,9 @@ type Ethereum struct {
 	lock sync.RWMutex // Protects the variadic fields (e.g. gas price and etherbase)
 
 	shutdownTracker *shutdowncheck.ShutdownTracker // Tracks if and when the node has shutdown ungracefully
+	
+	// Simulator system
+	simulator *simulator.Simulator
 }
 
 // New creates a new Ethereum object (including the initialisation of the common Ethereum object),
@@ -346,6 +350,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	// Start the RPC service
 	eth.netRPCService = ethapi.NewNetAPI(eth.p2pServer, networkID)
 
+	// Initialize simulator
+	eth.simulator = simulator.NewSimulator(eth.APIBackend)
+
 	// Register the backend on the node
 	stack.RegisterAPIs(eth.APIs())
 	stack.RegisterProtocols(eth.Protocols())
@@ -380,7 +387,7 @@ func (s *Ethereum) APIs() []rpc.API {
 	apis := ethapi.GetAPIs(s.APIBackend)
 
 	// Append all the local APIs and return
-	return append(apis, []rpc.API{
+	apis = append(apis, []rpc.API{
 		{
 			Namespace: "miner",
 			Service:   NewMinerAPI(s),
@@ -398,6 +405,13 @@ func (s *Ethereum) APIs() []rpc.API {
 			Service:   s.netRPCService,
 		},
 	}...)
+
+	// Add simulator APIs
+	if s.simulator != nil {
+		apis = append(apis, s.simulator.APIs()...)
+	}
+
+	return apis
 }
 
 func (s *Ethereum) ResetWithGenesisBlock(gb *types.Block) {
@@ -417,6 +431,9 @@ func (s *Ethereum) Downloader() *downloader.Downloader { return s.handler.downlo
 func (s *Ethereum) Synced() bool                       { return s.handler.synced.Load() }
 func (s *Ethereum) SetSynced()                         { s.handler.enableSyncedFeatures() }
 func (s *Ethereum) ArchiveMode() bool                  { return s.config.NoPruning }
+
+// Simulator returns the simulator instance
+func (s *Ethereum) Simulator() *simulator.Simulator { return s.simulator }
 
 // Protocols returns all the currently configured
 // network protocols to start.
@@ -447,6 +464,10 @@ func (s *Ethereum) Start() error {
 	// start log indexer
 	s.filterMaps.Start()
 	go s.updateFilterMapsHeads()
+	
+	// Simulator is initialized but not started automatically
+	// Use simulator_start() RPC method to start it manually
+	
 	return nil
 }
 
@@ -570,6 +591,14 @@ func (s *Ethereum) Stop() error {
 	s.closeFilterMaps <- ch
 	<-ch
 	s.filterMaps.Stop()
+	
+	// Stop simulator if it's running
+	if s.simulator != nil && s.simulator.IsRunning() {
+		if err := s.simulator.Stop(); err != nil {
+			log.Error("Failed to stop simulator", "error", err)
+		}
+	}
+	
 	s.txPool.Close()
 	s.blockchain.Stop()
 	s.engine.Close()
