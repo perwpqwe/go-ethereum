@@ -277,7 +277,7 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) *SimulationResult
 	s.stateMu.Unlock()
 
 	result.Success = true
-	result.Logs = simState.Logs()
+	result.Logs = simState.GetLogs(tx.Hash(), header.Number.Uint64(), header.Hash(), header.Time)
 	return result
 }
 
@@ -367,9 +367,8 @@ func (api *SimulatorAPI) Status() map[string]interface{} {
 	return status
 }
 
-// SubscribeSimulationResults subscribes to simulation results
 // Also available as "newEvents" for standard EthSubscribe pattern
-func (api *SimulatorAPI) SubscribeSimulationResults(ctx context.Context) (*rpc.Subscription, error) {
+func (api *SimulatorAPI) NewEvents(ctx context.Context) (*rpc.Subscription, error) {
 	notifier, supported := rpc.NotifierFromContext(ctx)
 	if !supported {
 		return nil, rpc.ErrNotificationsUnsupported
@@ -385,6 +384,7 @@ func (api *SimulatorAPI) SubscribeSimulationResults(ctx context.Context) (*rpc.S
 		for {
 			select {
 			case result := <-results:
+				api.simulator.logger.Info("New event", "result", result.Tx.Hash())
 				notifier.Notify(subscription.ID, result)
 			case <-subscription.Err():
 				return
@@ -395,9 +395,4 @@ func (api *SimulatorAPI) SubscribeSimulationResults(ctx context.Context) (*rpc.S
 	}()
 
 	return subscription, nil
-}
-
-// NewEvents is an alias for SubscribeSimulationResults to support standard EthSubscribe pattern
-func (api *SimulatorAPI) NewEvents(ctx context.Context) (*rpc.Subscription, error) {
-	return api.SubscribeSimulationResults(ctx)
 }
