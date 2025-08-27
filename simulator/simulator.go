@@ -257,7 +257,7 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) *SimulationResult
 		result.Error = "failed to convert transaction to message: " + err.Error()
 		return result
 	}
-
+	simState.SetTxContext(tx.Hash(), 0)
 	// Create EVM instance using the backend's GetEVM method
 	evm := s.backend.GetEVM(context.Background(), simState, header, &vm.Config{}, nil)
 
@@ -306,11 +306,13 @@ func (s *Simulator) run() {
 						"hash", tx.Hash().Hex(),
 						"logs", len(result.Logs))
 					// Emit the simulation result
+					s.logger.Info("Sending result to event feed", "hash", tx.Hash().Hex())
 					s.resultFeed.Send(result)
-				} else {
-					s.logger.Warn("Transaction simulation failed",
-						"hash", tx.Hash().Hex(),
-						"error", result.Error)
+					s.logger.Info("Result sent to event feed", "hash", tx.Hash().Hex())
+				// } else {
+				// 	s.logger.Warn("Transaction simulation failed",
+				// 		"hash", tx.Hash().Hex(),
+				// 		"error", result.Error)
 				}
 			}
 		case ev := <-s.blockCh:
@@ -367,32 +369,50 @@ func (api *SimulatorAPI) Status() map[string]interface{} {
 	return status
 }
 
-// Also available as "newEvents" for standard EthSubscribe pattern
-func (api *SimulatorAPI) NewEvents(ctx context.Context) (*rpc.Subscription, error) {
+// SubscribeSimulationResults subscribes to simulation results
+func (api *SimulatorAPI) SubscribeSimulationResults(ctx context.Context) (*rpc.Subscription, error) {
+	api.simulator.logger.Info("SubscribeSimulationResults called", "ctx", ctx)
+	
 	notifier, supported := rpc.NotifierFromContext(ctx)
 	if !supported {
+		api.simulator.logger.Error("Notifications not supported in context")
 		return nil, rpc.ErrNotificationsUnsupported
 	}
 
 	subscription := notifier.CreateSubscription()
+	api.simulator.logger.Info("Created subscription", "id", subscription.ID)
 
 	go func() {
 		results := make(chan *SimulationResult, 100)
 		sub := api.simulator.resultFeed.Subscribe(results)
 		defer sub.Unsubscribe()
+		
+		api.simulator.logger.Info("Started subscription goroutine", "subscriptionID", subscription.ID)
 
 		for {
 			select {
 			case result := <-results:
-				api.simulator.logger.Info("New event", "result", result.Tx.Hash())
+				api.simulator.logger.Info("Sending simulation result to subscriber", 
+					"subscriptionID", subscription.ID,
+					"txHash", result.Tx.Hash().Hex(),
+					"success", result.Success,
+					"logs", len(result.Logs))
 				notifier.Notify(subscription.ID, result)
 			case <-subscription.Err():
+				api.simulator.logger.Info("Subscription error, stopping goroutine", "subscriptionID", subscription.ID)
 				return
 			case <-ctx.Done():
+				api.simulator.logger.Info("Context done, stopping goroutine", "subscriptionID", subscription.ID)
 				return
 			}
 		}
 	}()
 
 	return subscription, nil
+}
+
+// NewEvents is an alias for SubscribeSimulationResults to support standard EthSubscribe pattern
+func (api *SimulatorAPI) NewEvents(ctx context.Context) (*rpc.Subscription, error) {
+	api.simulator.logger.Info("NewEvents called (alias for SubscribeSimulationResults)")
+	return api.SubscribeSimulationResults(ctx)
 }
