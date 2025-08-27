@@ -130,8 +130,13 @@ The simulator maintains a **pending state** that evolves as transactions are pro
 
 ### Transaction Flow
 ```
-New Transaction → Execute on Pending State → Update Pending State → Emit Result
+New Transaction → Check Chain ID → Check Transaction Type → Execute on Pending State → Update Pending State → Emit Result
 ```
+
+**Note:** The simulator only processes transactions that:
+- Match the current network's chain ID
+- Are not vanilla transactions (plain ETH transfers with 21000 gas)
+- Transactions from other networks or vanilla transfers are skipped with clear error messages.
 
 ### Block Event Handling
 ```

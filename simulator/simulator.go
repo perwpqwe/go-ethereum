@@ -18,6 +18,7 @@ package simulator
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
@@ -220,11 +222,37 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) *SimulationResult
 		return result
 	}
 
+	// Validate transaction
+	if tx == nil {
+		result.Error = "transaction is nil"
+		return result
+	}
+
 	// Set the block number in the result
 	result.BlockNumber = header.Number.Uint64()
 
+	// Check for valid chain ID and skip transactions from other networks
+	chainID := tx.ChainId()
+	if chainID == nil || chainID.Sign() == 0 {
+		result.Error = "invalid chain ID: chain ID cannot be zero or nil"
+		return result
+	}
+
+	// Skip transactions from other networks
+	currentChainID := s.backend.ChainConfig().ChainID
+	if chainID.Cmp(currentChainID) != 0 {
+		result.Error = fmt.Sprintf("skipped: transaction chain ID %s does not match current network chain ID %s", chainID.String(), currentChainID.String())
+		return result
+	}
+
+	// Skip vanilla transactions (plain ETH transfers)
+	if tx.Gas() == params.TxGas {
+		result.Error = "skipped: vanilla transaction (plain ETH transfer)"
+		return result
+	}
+
 	// Convert transaction to message
-	msg, err := core.TransactionToMessage(tx, types.LatestSignerForChainID(tx.ChainId()), header.BaseFee)
+	msg, err := core.TransactionToMessage(tx, types.LatestSignerForChainID(chainID), header.BaseFee)
 	if err != nil {
 		result.Error = "failed to convert transaction to message: " + err.Error()
 		return result
@@ -277,14 +305,13 @@ func (s *Simulator) run() {
 					s.logger.Info("Transaction simulation successful",
 						"hash", tx.Hash().Hex(),
 						"logs", len(result.Logs))
+					// Emit the simulation result
+					s.resultFeed.Send(result)
 				} else {
 					s.logger.Warn("Transaction simulation failed",
 						"hash", tx.Hash().Hex(),
 						"error", result.Error)
 				}
-
-				// Emit the simulation result
-				s.resultFeed.Send(result)
 			}
 		case ev := <-s.blockCh:
 			s.logger.Info("New block imported", "blockNumber", ev.Header.Number.Uint64(), "blockHash", ev.Header.Hash().Hex())
