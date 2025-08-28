@@ -41,8 +41,6 @@ import (
 type newEvent struct {
 	Tx             *types.Transaction             `json:"tx"`
 	Logs           []*types.Log                   `json:"logs"`
-	Success        bool                           `json:"success"`
-	Error          string                         `json:"error,omitempty"`
 	BlockNumber    uint64                         `json:"blockNumber"`
 	BalanceChanges map[common.Address]common.Hash `json:"balanceChanges,omitempty"`
 }
@@ -73,7 +71,9 @@ type Simulator struct {
 	stateMu       sync.RWMutex
 
 	// Statistics
-	txCount uint64 // Number of transactions executed since start
+	txCount     uint64 // Number of transactions executed since start
+	successCount uint64 // Number of successful transactions
+	failedCount  uint64 // Number of failed transactions
 
 	// Event system for simulation results
 	scope      event.SubscriptionScope
@@ -104,8 +104,10 @@ func (s *Simulator) Start() error {
 	s.running = true
 	s.stopCh = make(chan struct{})
 
-	// Reset transaction counter
+	// Reset transaction counters
 	atomic.StoreUint64(&s.txCount, 0)
+	atomic.StoreUint64(&s.successCount, 0)
+	atomic.StoreUint64(&s.failedCount, 0)
 
 	// Initialize pending state from the latest block
 	if err := s.initializePendingState(); err != nil {
@@ -207,6 +209,7 @@ func (s *Simulator) updatePendingStateFromHeader(header *types.Header) error {
 	// Create a new header with incremented block number for pending operations
 	pendingHeader := *header
 	pendingHeader.Number = new(big.Int).Add(header.Number, big.NewInt(1))
+	pendingHeader.Time = header.Time + 12
 	s.pendingHeader = &pendingHeader
 
 	s.logger.Info("Pending state updated from header", "blockNumber", header.Number.Uint64(), "pendingBlockNumber", s.pendingHeader.Number.Uint64(), "blockHash", header.Hash().Hex())
@@ -228,23 +231,20 @@ func (s *Simulator) GetPendingState() (*state.StateDB, *types.Header) {
 }
 
 // simulateTransaction simulates a transaction on the pending state
-func (s *Simulator) simulateTransaction(tx *types.Transaction) *newEvent {
+func (s *Simulator) simulateTransaction(tx *types.Transaction) (*newEvent, error) {
 	result := &newEvent{
-		Tx:      tx,
-		Success: false,
+		Tx: tx,
 	}
 
 	// Get the pending state and header
 	simState, header := s.GetPendingState()
 	if simState == nil || header == nil {
-		result.Error = "pending state not initialized"
-		return result
+		return result, fmt.Errorf("pending state not initialized")
 	}
 
 	// Validate transaction
 	if tx == nil {
-		result.Error = "transaction is nil"
-		return result
+		return result, fmt.Errorf("transaction is nil")
 	}
 
 	// Set the block number in the result
@@ -253,28 +253,24 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) *newEvent {
 	// Check for valid chain ID and skip transactions from other networks
 	chainID := tx.ChainId()
 	if chainID == nil || chainID.Sign() == 0 {
-		result.Error = "invalid chain ID: chain ID cannot be zero or nil"
-		return result
+		return result, fmt.Errorf("invalid chain ID: chain ID cannot be zero or nil")
 	}
 
 	// Skip transactions from other networks
 	currentChainID := s.backend.ChainConfig().ChainID
 	if chainID.Cmp(currentChainID) != 0 {
-		result.Error = fmt.Sprintf("skipped: transaction chain ID %s does not match current network chain ID %s", chainID.String(), currentChainID.String())
-		return result
+		return result, fmt.Errorf("skipped: transaction chain ID %s does not match current network chain ID %s", chainID.String(), currentChainID.String())
 	}
 
 	// Skip vanilla transactions (plain ETH transfers)
 	if tx.Gas() == params.TxGas {
-		result.Error = "skipped: vanilla transaction (plain ETH transfer)"
-		return result
+		return result, fmt.Errorf("skipped: vanilla transaction (plain ETH transfer)")
 	}
 
 	// Convert transaction to message
 	msg, err := core.TransactionToMessage(tx, types.LatestSignerForChainID(chainID), header.BaseFee)
 	if err != nil {
-		result.Error = "failed to convert transaction to message: " + err.Error()
-		return result
+		return result, fmt.Errorf("failed to convert transaction to message: %w", err)
 	}
 
 	// Create a map to store balance changes
@@ -302,8 +298,7 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) *newEvent {
 	_, err = core.ApplyMessage(evm, msg, gasPool)
 
 	if err != nil {
-		result.Error = "transaction execution failed: " + err.Error()
-		return result
+		return result, fmt.Errorf("transaction execution failed: %w", err)
 	}
 
 	// Update the pending state with the changes from this transaction
@@ -312,9 +307,8 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) *newEvent {
 	s.pendingState = simState
 	s.stateMu.Unlock()
 
-	result.Success = true
 	result.Logs = simState.GetLogs(tx.Hash(), header.Number.Uint64(), header.Hash(), header.Time)
-	return result
+	return result, nil
 }
 
 // run is the main loop of the simulator
@@ -337,30 +331,18 @@ func (s *Simulator) run() {
 				atomic.AddUint64(&s.txCount, 1)
 
 				// Simulate the transaction
-				result := s.simulateTransaction(tx)
+				result, err := s.simulateTransaction(tx)
 
-				// Log the result
-				if result.Success {
-					// s.logger.Info("Transaction simulation successful",
-					// 	"hash", tx.Hash().Hex(),
-					// 	"logs", len(result.Logs),
-					// 	"balanceChanges", len(result.BalanceChanges))
-
-					// // Log balance changes if any
-					// for _, change := range result.BalanceChanges {
-					// 	s.logger.Info("Balance change",
-					// 		"address", change.Hex(),
-					// 		"balance", change)
-					// }
-
+				// Check if transaction was successful based on error return
+				if err == nil {
+					// Transaction was successful
+					atomic.AddUint64(&s.successCount, 1)
 					// Emit the simulation result
-					// s.logger.Info("Sending result to event feed", "hash", tx.Hash().Hex())
 					s.resultFeed.Send(result)
-					// s.logger.Info("Result sent to event feed", "hash", tx.Hash().Hex())
-					// } else {
-					// 	s.logger.Warn("Transaction simulation failed",
-					// 		"hash", tx.Hash().Hex(),
-					// 		"error", result.Error)
+				} else {
+					// Transaction failed or was reverted
+					atomic.AddUint64(&s.failedCount, 1)
+					// Don't send event for failed transactions
 				}
 			}
 		case ev := <-s.blockCh:
@@ -375,10 +357,9 @@ func (s *Simulator) run() {
 
 			// Create a consolidated newEvent with all logs from the block
 			if len(logs) > 0 {
-				blockNumber := logs[0].BlockNumber
+				blockNumber := logs[0].BlockNumber + 1
 				consolidatedEvent := &newEvent{
 					Logs:        logs,
-					Success:     true,
 					BlockNumber: blockNumber,
 				}
 				// s.logger.Info("Sending consolidated logs event", "blockNumber", blockNumber, "logCount", len(logs))
@@ -417,8 +398,10 @@ func (api *SimulatorAPI) Stop() error {
 // Status returns the status of the simulator
 func (api *SimulatorAPI) Status() map[string]interface{} {
 	status := map[string]any{
-		"running": api.simulator.IsRunning(),
-		"txCount": atomic.LoadUint64(&api.simulator.txCount),
+		"running":      api.simulator.IsRunning(),
+		"txCount":      atomic.LoadUint64(&api.simulator.txCount),
+		"successCount": atomic.LoadUint64(&api.simulator.successCount),
+		"failedCount":  atomic.LoadUint64(&api.simulator.failedCount),
 	}
 
 	// Add pending state information if available
