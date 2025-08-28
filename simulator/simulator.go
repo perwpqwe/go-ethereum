@@ -42,8 +42,8 @@ type BalanceChange struct {
 	Balance string         `json:"balance"` // New balance as hex string
 }
 
-// SimulationResult represents the result of a transaction simulation
-type SimulationResult struct {
+// newEvent represents the result of a transaction simulation
+type newEvent struct {
 	Tx             *types.Transaction `json:"tx"`
 	Logs           []*types.Log       `json:"logs"`
 	Success        bool               `json:"success"`
@@ -68,6 +68,10 @@ type Simulator struct {
 	blockSub event.Subscription
 	blockCh  chan core.ChainEvent
 
+	// Logs subscription
+	logsSub event.Subscription
+	logsCh  chan []*types.Log
+
 	// Pending state and header management
 	pendingState  *state.StateDB
 	pendingHeader *types.Header
@@ -86,6 +90,7 @@ func NewSimulator(backend ethapi.Backend) *Simulator {
 		backend: backend,
 		txCh:    make(chan core.NewTxsEvent, 100),
 		blockCh: make(chan core.ChainEvent, 10),
+		logsCh:  make(chan []*types.Log, 50),
 	}
 }
 
@@ -107,10 +112,11 @@ func (s *Simulator) Start() error {
 		return err
 	}
 
-	// Subscribe to new transactions and block events if backend is available
+	// Subscribe to new transactions, block events, and logs if backend is available
 	if s.backend != nil {
 		s.txSub = s.backend.SubscribeNewTxsEvent(s.txCh)
 		s.blockSub = s.backend.SubscribeChainEvent(s.blockCh)
+		s.logsSub = s.backend.SubscribeLogsEvent(s.logsCh)
 	}
 
 	// Start background task
@@ -132,12 +138,15 @@ func (s *Simulator) Stop() error {
 	s.running = false
 	close(s.stopCh)
 
-	// Unsubscribe from transactions and block events
+	// Unsubscribe from transactions, block events, and logs
 	if s.txSub != nil {
 		s.txSub.Unsubscribe()
 	}
 	if s.blockSub != nil {
 		s.blockSub.Unsubscribe()
+	}
+	if s.logsSub != nil {
+		s.logsSub.Unsubscribe()
 	}
 
 	// Clear pending state
@@ -218,8 +227,8 @@ func (s *Simulator) GetPendingState() (*state.StateDB, *types.Header) {
 }
 
 // simulateTransaction simulates a transaction on the pending state
-func (s *Simulator) simulateTransaction(tx *types.Transaction) *SimulationResult {
-	result := &SimulationResult{
+func (s *Simulator) simulateTransaction(tx *types.Transaction) *newEvent {
+	result := &newEvent{
 		Tx:      tx,
 		Success: false,
 	}
@@ -363,6 +372,25 @@ func (s *Simulator) run() {
 			if err := s.updatePendingStateFromHeader(ev.Header); err != nil {
 				s.logger.Error("Failed to update pending state", "error", err)
 			}
+		case logs := <-s.logsCh:
+			s.logger.Info("New logs received", "count", len(logs), "blockNumber", logs[0].BlockNumber)
+
+			// Create a consolidated newEvent with all logs from the block
+			if len(logs) > 0 {
+				blockNumber := logs[0].BlockNumber
+				consolidatedEvent := &newEvent{
+					Tx:             nil, // No specific transaction for consolidated logs
+					Logs:           logs,
+					Success:        true,
+					Error:          "",
+					BlockNumber:    blockNumber,
+					BalanceChanges: make([]*BalanceChange, 0), // No balance changes for logs-only events
+				}
+
+				s.logger.Info("Sending consolidated logs event", "blockNumber", blockNumber, "logCount", len(logs))
+				s.resultFeed.Send(consolidatedEvent)
+				s.logger.Info("Consolidated logs event sent", "blockNumber", blockNumber)
+			}
 		}
 	}
 }
@@ -424,7 +452,7 @@ func (api *SimulatorAPI) NewEvents(ctx context.Context) (*rpc.Subscription, erro
 	api.simulator.logger.Info("Created subscription", "id", subscription.ID)
 
 	go func() {
-		results := make(chan *SimulationResult, 128)
+		results := make(chan *newEvent, 128)
 		sub := api.simulator.resultFeed.Subscribe(results)
 		defer sub.Unsubscribe()
 
