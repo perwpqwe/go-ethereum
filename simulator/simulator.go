@@ -23,8 +23,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/event"
@@ -34,13 +36,20 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
+// BalanceChange represents a balance change for an account
+type BalanceChange struct {
+	Address common.Address `json:"address"`
+	Balance string         `json:"balance"` // New balance as hex string
+}
+
 // SimulationResult represents the result of a transaction simulation
 type SimulationResult struct {
-	Tx          *types.Transaction `json:"tx"`
-	Logs        []*types.Log       `json:"logs"`
-	Success     bool               `json:"success"`
-	Error       string             `json:"error,omitempty"`
-	BlockNumber uint64             `json:"blockNumber"`
+	Tx             *types.Transaction `json:"tx"`
+	Logs           []*types.Log       `json:"logs"`
+	Success        bool               `json:"success"`
+	Error          string             `json:"error,omitempty"`
+	BlockNumber    uint64             `json:"blockNumber"`
+	BalanceChanges []*BalanceChange   `json:"balanceChanges,omitempty"`
 }
 
 // Simulator is a simple standalone simulator with start/stop/status functionality
@@ -257,9 +266,26 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) *SimulationResult
 		result.Error = "failed to convert transaction to message: " + err.Error()
 		return result
 	}
+
+	// Create a map to store balance changes
+	balanceChanges := make(map[common.Address]*BalanceChange)
+
+	// Create tracing hooks to capture balance changes
+	hooks := &tracing.Hooks{
+		OnBalanceChange: func(addr common.Address, prev, new *big.Int, reason tracing.BalanceChangeReason) {
+			// Store the new balance
+			balanceChanges[addr] = &BalanceChange{
+				Address: addr,
+				Balance: "0x" + new.Text(16), // Convert to hex string with 0x prefix
+			}
+		},
+	}
 	simState.SetTxContext(tx.Hash(), 0)
-	// Create EVM instance using the backend's GetEVM method
-	evm := s.backend.GetEVM(context.Background(), simState, header, &vm.Config{}, nil)
+	// Create hooked state with tracing hooks
+	hookedState := state.NewHookedState(simState, hooks)
+	// Use GetEVM with nil state, then assign the hooked state
+	evm := s.backend.GetEVM(context.Background(), nil, header, &vm.Config{}, nil)
+	evm.StateDB = hookedState
 
 	// Execute the transaction
 	gasPool := new(core.GasPool).AddGas(tx.Gas())
@@ -268,6 +294,12 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) *SimulationResult
 	if err != nil {
 		result.Error = "transaction execution failed: " + err.Error()
 		return result
+	}
+
+	// Convert balance changes map to slice
+	result.BalanceChanges = make([]*BalanceChange, 0, len(balanceChanges))
+	for _, change := range balanceChanges {
+		result.BalanceChanges = append(result.BalanceChanges, change)
 	}
 
 	// Update the pending state with the changes from this transaction
@@ -304,15 +336,24 @@ func (s *Simulator) run() {
 				if result.Success {
 					s.logger.Info("Transaction simulation successful",
 						"hash", tx.Hash().Hex(),
-						"logs", len(result.Logs))
+						"logs", len(result.Logs),
+						"balanceChanges", len(result.BalanceChanges))
+
+					// Log balance changes if any
+					for _, change := range result.BalanceChanges {
+						s.logger.Info("Balance change",
+							"address", change.Address.Hex(),
+							"balance", change.Balance)
+					}
+
 					// Emit the simulation result
 					s.logger.Info("Sending result to event feed", "hash", tx.Hash().Hex())
 					s.resultFeed.Send(result)
 					s.logger.Info("Result sent to event feed", "hash", tx.Hash().Hex())
-				// } else {
-				// 	s.logger.Warn("Transaction simulation failed",
-				// 		"hash", tx.Hash().Hex(),
-				// 		"error", result.Error)
+					// } else {
+					// 	s.logger.Warn("Transaction simulation failed",
+					// 		"hash", tx.Hash().Hex(),
+					// 		"error", result.Error)
 				}
 			}
 		case ev := <-s.blockCh:
@@ -370,9 +411,9 @@ func (api *SimulatorAPI) Status() map[string]interface{} {
 }
 
 // SubscribeSimulationResults subscribes to simulation results
-func (api *SimulatorAPI) SubscribeSimulationResults(ctx context.Context) (*rpc.Subscription, error) {
+func (api *SimulatorAPI) NewEvents(ctx context.Context) (*rpc.Subscription, error) {
 	api.simulator.logger.Info("SubscribeSimulationResults called", "ctx", ctx)
-	
+
 	notifier, supported := rpc.NotifierFromContext(ctx)
 	if !supported {
 		api.simulator.logger.Error("Notifications not supported in context")
@@ -386,13 +427,13 @@ func (api *SimulatorAPI) SubscribeSimulationResults(ctx context.Context) (*rpc.S
 		results := make(chan *SimulationResult, 128)
 		sub := api.simulator.resultFeed.Subscribe(results)
 		defer sub.Unsubscribe()
-		
+
 		api.simulator.logger.Info("Started subscription goroutine", "subscriptionID", subscription.ID)
 
 		for {
 			select {
 			case result := <-results:
-				api.simulator.logger.Info("Sending simulation result to subscriber", 
+				api.simulator.logger.Info("Sending simulation result to subscriber",
 					"subscriptionID", subscription.ID,
 					"txHash", result.Tx.Hash().Hex(),
 					"success", result.Success,
@@ -406,10 +447,4 @@ func (api *SimulatorAPI) SubscribeSimulationResults(ctx context.Context) (*rpc.S
 	}()
 
 	return subscription, nil
-}
-
-// NewEvents is an alias for SubscribeSimulationResults to support standard EthSubscribe pattern
-func (api *SimulatorAPI) NewEvents(ctx context.Context) (*rpc.Subscription, error) {
-	api.simulator.logger.Info("NewEvents called (alias for SubscribeSimulationResults)")
-	return api.SubscribeSimulationResults(ctx)
 }
