@@ -36,20 +36,14 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
-// BalanceChange represents a balance change for an account
-type BalanceChange struct {
-	Address common.Address `json:"address"`
-	Balance string         `json:"balance"` // New balance as hex string
-}
-
 // newEvent represents the result of a transaction simulation
 type newEvent struct {
-	Tx             *types.Transaction `json:"tx"`
-	Logs           []*types.Log       `json:"logs"`
-	Success        bool               `json:"success"`
-	Error          string             `json:"error,omitempty"`
-	BlockNumber    uint64             `json:"blockNumber"`
-	BalanceChanges []*BalanceChange   `json:"balanceChanges,omitempty"`
+	Tx             *types.Transaction             `json:"tx"`
+	Logs           []*types.Log                   `json:"logs"`
+	Success        bool                           `json:"success"`
+	Error          string                         `json:"error,omitempty"`
+	BlockNumber    uint64                         `json:"blockNumber"`
+	BalanceChanges map[common.Address]common.Hash `json:"balanceChanges,omitempty"`
 }
 
 // Simulator is a simple standalone simulator with start/stop/status functionality
@@ -277,16 +271,13 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) *newEvent {
 	}
 
 	// Create a map to store balance changes
-	balanceChanges := make(map[common.Address]*BalanceChange)
+	result.BalanceChanges = make(map[common.Address]common.Hash)
 
 	// Create tracing hooks to capture balance changes
 	hooks := &tracing.Hooks{
 		OnBalanceChange: func(addr common.Address, prev, new *big.Int, reason tracing.BalanceChangeReason) {
 			// Store the new balance
-			balanceChanges[addr] = &BalanceChange{
-				Address: addr,
-				Balance: "0x" + new.Text(16), // Convert to hex string with 0x prefix
-			}
+			result.BalanceChanges[addr] = common.BigToHash(new)
 		},
 	}
 	simState.SetTxContext(tx.Hash(), 0)
@@ -303,12 +294,6 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) *newEvent {
 	if err != nil {
 		result.Error = "transaction execution failed: " + err.Error()
 		return result
-	}
-
-	// Convert balance changes map to slice
-	result.BalanceChanges = make([]*BalanceChange, 0, len(balanceChanges))
-	for _, change := range balanceChanges {
-		result.BalanceChanges = append(result.BalanceChanges, change)
 	}
 
 	// Update the pending state with the changes from this transaction
@@ -351,8 +336,8 @@ func (s *Simulator) run() {
 					// Log balance changes if any
 					for _, change := range result.BalanceChanges {
 						s.logger.Info("Balance change",
-							"address", change.Address.Hex(),
-							"balance", change.Balance)
+							"address", change.Hex(),
+							"balance", change)
 					}
 
 					// Emit the simulation result
@@ -379,14 +364,10 @@ func (s *Simulator) run() {
 			if len(logs) > 0 {
 				blockNumber := logs[0].BlockNumber
 				consolidatedEvent := &newEvent{
-					Tx:             nil, // No specific transaction for consolidated logs
-					Logs:           logs,
-					Success:        true,
-					Error:          "",
-					BlockNumber:    blockNumber,
-					BalanceChanges: make([]*BalanceChange, 0), // No balance changes for logs-only events
+					Logs:        logs,
+					Success:     true,
+					BlockNumber: blockNumber,
 				}
-
 				s.logger.Info("Sending consolidated logs event", "blockNumber", blockNumber, "logCount", len(logs))
 				s.resultFeed.Send(consolidatedEvent)
 				s.logger.Info("Consolidated logs event sent", "blockNumber", blockNumber)
