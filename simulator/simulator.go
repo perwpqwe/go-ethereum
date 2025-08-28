@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -71,6 +72,9 @@ type Simulator struct {
 	pendingHeader *types.Header
 	stateMu       sync.RWMutex
 
+	// Statistics
+	txCount uint64 // Number of transactions executed since start
+
 	// Event system for simulation results
 	scope      event.SubscriptionScope
 	resultFeed event.Feed
@@ -99,6 +103,9 @@ func (s *Simulator) Start() error {
 
 	s.running = true
 	s.stopCh = make(chan struct{})
+
+	// Reset transaction counter
+	atomic.StoreUint64(&s.txCount, 0)
 
 	// Initialize pending state from the latest block
 	if err := s.initializePendingState(); err != nil {
@@ -276,6 +283,9 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) *newEvent {
 	// Create tracing hooks to capture balance changes
 	hooks := &tracing.Hooks{
 		OnBalanceChange: func(addr common.Address, prev, new *big.Int, reason tracing.BalanceChangeReason) {
+			if addr == msg.From || addr == header.Coinbase {
+				return
+			}
 			// Store the new balance
 			result.BalanceChanges[addr] = common.BigToHash(new)
 		},
@@ -319,31 +329,34 @@ func (s *Simulator) run() {
 		case <-ticker.C:
 			s.logger.Info("Simulator heartbeat", "timestamp", time.Now())
 		case ev := <-s.txCh:
-			s.logger.Info("New transaction received", "count", len(ev.Txs))
+			// s.logger.Info("New transaction received", "count", len(ev.Txs))
 			for _, tx := range ev.Txs {
-				s.logger.Info("Simulating transaction", "hash", tx.Hash().Hex())
+				// s.logger.Info("Simulating transaction", "hash", tx.Hash().Hex())
+
+				// Increment transaction counter
+				atomic.AddUint64(&s.txCount, 1)
 
 				// Simulate the transaction
 				result := s.simulateTransaction(tx)
 
 				// Log the result
 				if result.Success {
-					s.logger.Info("Transaction simulation successful",
-						"hash", tx.Hash().Hex(),
-						"logs", len(result.Logs),
-						"balanceChanges", len(result.BalanceChanges))
+					// s.logger.Info("Transaction simulation successful",
+					// 	"hash", tx.Hash().Hex(),
+					// 	"logs", len(result.Logs),
+					// 	"balanceChanges", len(result.BalanceChanges))
 
-					// Log balance changes if any
-					for _, change := range result.BalanceChanges {
-						s.logger.Info("Balance change",
-							"address", change.Hex(),
-							"balance", change)
-					}
+					// // Log balance changes if any
+					// for _, change := range result.BalanceChanges {
+					// 	s.logger.Info("Balance change",
+					// 		"address", change.Hex(),
+					// 		"balance", change)
+					// }
 
 					// Emit the simulation result
-					s.logger.Info("Sending result to event feed", "hash", tx.Hash().Hex())
+					// s.logger.Info("Sending result to event feed", "hash", tx.Hash().Hex())
 					s.resultFeed.Send(result)
-					s.logger.Info("Result sent to event feed", "hash", tx.Hash().Hex())
+					// s.logger.Info("Result sent to event feed", "hash", tx.Hash().Hex())
 					// } else {
 					// 	s.logger.Warn("Transaction simulation failed",
 					// 		"hash", tx.Hash().Hex(),
@@ -351,14 +364,14 @@ func (s *Simulator) run() {
 				}
 			}
 		case ev := <-s.blockCh:
-			s.logger.Info("New block imported", "blockNumber", ev.Header.Number.Uint64(), "blockHash", ev.Header.Hash().Hex())
+			// s.logger.Info("New block imported", "blockNumber", ev.Header.Number.Uint64(), "blockHash", ev.Header.Hash().Hex())
 
 			// Update pending state with the new block
 			if err := s.updatePendingStateFromHeader(ev.Header); err != nil {
 				s.logger.Error("Failed to update pending state", "error", err)
 			}
 		case logs := <-s.logsCh:
-			s.logger.Info("New logs received", "count", len(logs), "blockNumber", logs[0].BlockNumber)
+			// s.logger.Info("New logs received", "count", len(logs), "blockNumber", logs[0].BlockNumber)
 
 			// Create a consolidated newEvent with all logs from the block
 			if len(logs) > 0 {
@@ -368,9 +381,9 @@ func (s *Simulator) run() {
 					Success:     true,
 					BlockNumber: blockNumber,
 				}
-				s.logger.Info("Sending consolidated logs event", "blockNumber", blockNumber, "logCount", len(logs))
+				// s.logger.Info("Sending consolidated logs event", "blockNumber", blockNumber, "logCount", len(logs))
 				s.resultFeed.Send(consolidatedEvent)
-				s.logger.Info("Consolidated logs event sent", "blockNumber", blockNumber)
+				// s.logger.Info("Consolidated logs event sent", "blockNumber", blockNumber)
 			}
 		}
 	}
@@ -404,8 +417,8 @@ func (api *SimulatorAPI) Stop() error {
 // Status returns the status of the simulator
 func (api *SimulatorAPI) Status() map[string]interface{} {
 	status := map[string]any{
-		"running":   api.simulator.IsRunning(),
-		"timestamp": time.Now(),
+		"running": api.simulator.IsRunning(),
+		"txCount": atomic.LoadUint64(&api.simulator.txCount),
 	}
 
 	// Add pending state information if available
@@ -421,7 +434,7 @@ func (api *SimulatorAPI) Status() map[string]interface{} {
 
 // SubscribeSimulationResults subscribes to simulation results
 func (api *SimulatorAPI) NewEvents(ctx context.Context) (*rpc.Subscription, error) {
-	api.simulator.logger.Info("SubscribeSimulationResults called", "ctx", ctx)
+	api.simulator.logger.Info("NewEvents called", "ctx", ctx)
 
 	notifier, supported := rpc.NotifierFromContext(ctx)
 	if !supported {
@@ -442,11 +455,11 @@ func (api *SimulatorAPI) NewEvents(ctx context.Context) (*rpc.Subscription, erro
 		for {
 			select {
 			case result := <-results:
-				api.simulator.logger.Info("Sending simulation result to subscriber",
-					"subscriptionID", subscription.ID,
-					"txHash", result.Tx.Hash().Hex(),
-					"success", result.Success,
-					"logs", len(result.Logs))
+				// api.simulator.logger.Info("Sending simulation result to subscriber",
+				// 	"subscriptionID", subscription.ID,
+				// 	"txHash", result.Tx.Hash().Hex(),
+				// 	"success", result.Success,
+				// 	"logs", len(result.Logs))
 				notifier.Notify(subscription.ID, result)
 			case <-subscription.Err():
 				api.simulator.logger.Info("Subscription error, stopping goroutine", "subscriptionID", subscription.ID)
