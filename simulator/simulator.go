@@ -47,8 +47,7 @@ type newEvent struct {
 
 // Simulator is a simple standalone simulator with start/stop/status functionality
 type Simulator struct {
-	running bool
-	mu      sync.RWMutex
+	running atomic.Bool
 	stopCh  chan struct{}
 	logger  log.Logger
 
@@ -71,7 +70,7 @@ type Simulator struct {
 	stateMu       sync.RWMutex
 
 	// Statistics
-	txCount     uint64 // Number of transactions executed since start
+	txCount      uint64 // Number of transactions executed since start
 	successCount uint64 // Number of successful transactions
 	failedCount  uint64 // Number of failed transactions
 
@@ -86,22 +85,18 @@ func NewSimulator(backend ethapi.Backend) *Simulator {
 		logger:  log.New("module", "simulator"),
 		stopCh:  make(chan struct{}),
 		backend: backend,
-		txCh:    make(chan core.NewTxsEvent, 100),
-		blockCh: make(chan core.ChainEvent, 10),
-		logsCh:  make(chan []*types.Log, 50),
+		txCh:    make(chan core.NewTxsEvent, 1024),
+		blockCh: make(chan core.ChainEvent, 1024),
+		logsCh:  make(chan []*types.Log, 1024),
 	}
 }
 
 // Start starts the simulator
 func (s *Simulator) Start() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.running {
-		return nil // Already running
+	if s.running.Load() {
+		return fmt.Errorf("simulator is already running")
 	}
 
-	s.running = true
 	s.stopCh = make(chan struct{})
 
 	// Reset transaction counters
@@ -110,10 +105,11 @@ func (s *Simulator) Start() error {
 	atomic.StoreUint64(&s.failedCount, 0)
 
 	// Initialize pending state from the latest block
-	if err := s.initializePendingState(); err != nil {
-		s.running = false
+	if err := s.updatePendingState(); err != nil {
 		return err
 	}
+
+	s.running.Store(true)
 
 	// Subscribe to new transactions, block events, and logs if backend is available
 	if s.backend != nil {
@@ -124,6 +120,7 @@ func (s *Simulator) Start() error {
 
 	// Start background task
 	go s.run()
+	go s.handleNewTxsEvent()
 
 	s.logger.Info("Simulator started")
 	return nil
@@ -131,14 +128,11 @@ func (s *Simulator) Start() error {
 
 // Stop stops the simulator
 func (s *Simulator) Stop() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.running {
-		return nil // Already stopped
+	if !s.running.Load() {
+		return fmt.Errorf("simulator is not running")
 	}
 
-	s.running = false
+	s.running.Store(false)
 	close(s.stopCh)
 
 	// Unsubscribe from transactions, block events, and logs
@@ -164,13 +158,11 @@ func (s *Simulator) Stop() error {
 
 // IsRunning returns true if the simulator is running
 func (s *Simulator) IsRunning() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.running
+	return s.running.Load()
 }
 
-// initializePendingState initializes the pending state and header from the latest block
-func (s *Simulator) initializePendingState() error {
+// updatePendingState initializes the pending state and header from the latest block
+func (s *Simulator) updatePendingState() error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 
@@ -181,38 +173,14 @@ func (s *Simulator) initializePendingState() error {
 	}
 
 	// Copy is necessary here to create an isolated state for pending operations
-	s.pendingState = stateDB.Copy()
+	s.pendingState = stateDB
 
 	// Create a new header with incremented block number for pending operations
 	pendingHeader := *header
 	pendingHeader.Number = new(big.Int).Add(header.Number, big.NewInt(1))
 	s.pendingHeader = &pendingHeader
 
-	s.logger.Info("Pending state initialized", "blockNumber", header.Number.Uint64(), "pendingBlockNumber", s.pendingHeader.Number.Uint64(), "blockHash", header.Hash().Hex())
-	return nil
-}
-
-// updatePendingStateFromHeader updates the pending state and header from a header
-func (s *Simulator) updatePendingStateFromHeader(header *types.Header) error {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-
-	// Get the state for the new block
-	stateDB, _, err := s.backend.StateAndHeaderByNumber(context.Background(), rpc.BlockNumber(header.Number.Uint64()))
-	if err != nil {
-		return err
-	}
-
-	// Copy is necessary here to create an isolated state for pending operations
-	s.pendingState = stateDB.Copy()
-
-	// Create a new header with incremented block number for pending operations
-	pendingHeader := *header
-	pendingHeader.Number = new(big.Int).Add(header.Number, big.NewInt(1))
-	pendingHeader.Time = header.Time + 12
-	s.pendingHeader = &pendingHeader
-
-	s.logger.Info("Pending state updated from header", "blockNumber", header.Number.Uint64(), "pendingBlockNumber", s.pendingHeader.Number.Uint64(), "blockHash", header.Hash().Hex())
+	s.logger.Info("update pending state ", "blockNumber", header.Number.Uint64(), "age", common.PrettyDuration(time.Since(time.Unix(int64(header.Time), 0))))
 	return nil
 }
 
@@ -232,49 +200,47 @@ func (s *Simulator) GetPendingState() (*state.StateDB, *types.Header) {
 
 // simulateTransaction simulates a transaction on the pending state
 func (s *Simulator) simulateTransaction(tx *types.Transaction) (*newEvent, error) {
-	result := &newEvent{
-		Tx: tx,
-	}
 
 	// Get the pending state and header
 	simState, header := s.GetPendingState()
 	if simState == nil || header == nil {
-		return result, fmt.Errorf("pending state not initialized")
+		return nil, fmt.Errorf("pending state not initialized")
 	}
 
 	// Validate transaction
 	if tx == nil {
-		return result, fmt.Errorf("transaction is nil")
+		return nil, fmt.Errorf("transaction is nil")
 	}
-
-	// Set the block number in the result
-	result.BlockNumber = header.Number.Uint64()
-
 	// Check for valid chain ID and skip transactions from other networks
 	chainID := tx.ChainId()
 	if chainID == nil || chainID.Sign() == 0 {
-		return result, fmt.Errorf("invalid chain ID: chain ID cannot be zero or nil")
+		return nil, fmt.Errorf("invalid chain ID: chain ID cannot be zero or nil")
 	}
 
 	// Skip transactions from other networks
 	currentChainID := s.backend.ChainConfig().ChainID
 	if chainID.Cmp(currentChainID) != 0 {
-		return result, fmt.Errorf("skipped: transaction chain ID %s does not match current network chain ID %s", chainID.String(), currentChainID.String())
+		return nil, fmt.Errorf("skipped: transaction chain ID %s does not match current network chain ID %s", chainID.String(), currentChainID.String())
 	}
 
 	// Skip vanilla transactions (plain ETH transfers)
 	if tx.Gas() == params.TxGas {
-		return result, fmt.Errorf("skipped: vanilla transaction (plain ETH transfer)")
+		return nil, fmt.Errorf("skipped: vanilla transaction (plain ETH transfer)")
 	}
 
 	// Convert transaction to message
 	msg, err := core.TransactionToMessage(tx, types.LatestSignerForChainID(chainID), header.BaseFee)
 	if err != nil {
-		return result, fmt.Errorf("failed to convert transaction to message: %w", err)
+		return nil, fmt.Errorf("failed to convert transaction to message: %w", err)
+	}
+
+	result := &newEvent{
+		Tx:             tx,
+		BlockNumber:    header.Number.Uint64(),
+		BalanceChanges: make(map[common.Address]common.Hash),
 	}
 
 	// Create a map to store balance changes
-	result.BalanceChanges = make(map[common.Address]common.Hash)
 
 	// Create tracing hooks to capture balance changes
 	hooks := &tracing.Hooks{
@@ -311,19 +277,12 @@ func (s *Simulator) simulateTransaction(tx *types.Transaction) (*newEvent, error
 	return result, nil
 }
 
-// run is the main loop of the simulator
-func (s *Simulator) run() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
+func (s *Simulator) handleNewTxsEvent() {
 	for {
 		select {
 		case <-s.stopCh:
 			return
-		case <-ticker.C:
-			s.logger.Info("Simulator heartbeat", "timestamp", time.Now())
 		case ev := <-s.txCh:
-			// s.logger.Info("New transaction received", "count", len(ev.Txs))
 			for _, tx := range ev.Txs {
 				// s.logger.Info("Simulating transaction", "hash", tx.Hash().Hex())
 
@@ -345,11 +304,26 @@ func (s *Simulator) run() {
 					// Don't send event for failed transactions
 				}
 			}
-		case ev := <-s.blockCh:
+		}
+	}
+}
+
+// run is the main loop of the simulator
+func (s *Simulator) run() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.logger.Info("Simulator heartbeat", "timestamp", time.Now())
+		case <-s.blockCh:
 			// s.logger.Info("New block imported", "blockNumber", ev.Header.Number.Uint64(), "blockHash", ev.Header.Hash().Hex())
 
 			// Update pending state with the new block
-			if err := s.updatePendingStateFromHeader(ev.Header); err != nil {
+			if err := s.updatePendingState(); err != nil {
 				s.logger.Error("Failed to update pending state", "error", err)
 			}
 		case logs := <-s.logsCh:
