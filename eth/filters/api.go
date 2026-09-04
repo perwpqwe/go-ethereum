@@ -356,11 +356,17 @@ func (api *FilterAPI) TransactionReceipts(ctx context.Context, filter *Transacti
 					// Convert to the same format as eth_getTransactionReceipt
 					marshaledReceipts := make([]map[string]interface{}, len(receiptsWithTxs))
 					for i, receiptWithTx := range receiptsWithTxs {
-						header, err := api.sys.backend.HeaderByHash(ctx, receiptWithTx.Receipt.BlockHash)
+						// The request context used to create a subscription is canceled once the
+						// subscribe RPC returns. Keep receipt enrichment tied to the goroutine
+						// lifetime instead, otherwise every live notification loses block metadata
+						// and spams "context canceled" for each transaction.
+						metadataCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+						header, err := api.sys.backend.HeaderByHash(metadataCtx, receiptWithTx.Receipt.BlockHash)
 						if err != nil {
 							log.Error("failed to get block header for receipt", "txhash", receiptWithTx.Receipt.TxHash, "blockhash", receiptWithTx.Receipt.BlockHash, "err", err)
 						}
-						blockMetadata, err := api.sys.backend.BlockMetadataByNumber(ctx, receiptWithTx.Receipt.BlockNumber.Uint64())
+						blockMetadata, err := api.sys.backend.BlockMetadataByNumber(metadataCtx, receiptWithTx.Receipt.BlockNumber.Uint64())
+						cancel()
 						if err != nil {
 							log.Error("failed to get block metadata for receipt", "txhash", receiptWithTx.Receipt.TxHash, "blocknumber", receiptWithTx.Receipt.BlockNumber, "err", err)
 						}
